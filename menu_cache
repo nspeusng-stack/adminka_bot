@@ -1,0 +1,27 @@
+import aiosqlite
+import os
+
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+# {section: [(text, type, target, content_id, visible_for), ...]}
+menu_cache = {}
+
+async def load_menu():
+    """Перечитывает меню из базы и кладёт в кэш"""
+    global menu_cache
+    menu_cache.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT section, text, type, target, content_id, COALESCE(visible_for, 'all')
+            FROM menu_buttons
+            ORDER BY section, position ASC, id ASC
+        """) as cur:
+            async for section, text, kind, target, cid, visible_for in cur:
+                menu_cache.setdefault(section, []).append(
+                    (text, kind, target, cid, visible_for)
+                )
+    print("✅ Меню обновлено:", menu_cache)
+
+def get_section(section: str):
+    """Возвращает список кнопок для раздела"""
+    return menu_cache.get(section, [])
