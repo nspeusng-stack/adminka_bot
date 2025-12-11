@@ -1,0 +1,33 @@
+import asyncio
+import os
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher
+from db import init_db
+
+# Загружаем .env до импортов хендлеров
+load_dotenv()
+
+# Проверки окружения
+for var in ("BOT_TOKEN", "ADMIN_IDS", "DB_PATH"):
+    if not os.getenv(var):
+        raise RuntimeError(f"{var} не задан в .env")
+
+from handlers import admin, user  # импорт после load_dotenv
+
+async def main():
+    await init_db()
+
+    bot = Bot(token=os.getenv("BOT_TOKEN"))
+    dp = Dispatcher()
+
+    dp.include_router(admin.router)
+    dp.include_router(user.router)
+
+    print("🚀 Бот запущен. Нажми Ctrl+C для остановки.")
+    try:
+        await dp.start_polling(bot)
+    except (KeyboardInterrupt, SystemExit):
+        print("🛑 Бот остановлен пользователем.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
