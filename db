@@ -1,0 +1,219 @@
+import aiosqlite
+import os
+
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+# Иерархия доступа
+ROLE_ACCESS = {
+    "seller": ["seller"],
+    "admin": ["admin", "seller"],
+    "нсы": ["нсы", "admin", "seller"],
+    "офис": ["офис", "нсы", "admin", "seller", "all"]
+}
+
+# ---------------- ИНИЦИАЛИЗАЦИЯ ----------------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout = 3000")
+
+        # USERS
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            role TEXT DEFAULT 'seller',
+            is_banned INTEGER DEFAULT 0,
+            approved INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        # CONTENT
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS content (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            data TEXT NOT NULL,
+            caption TEXT,
+            description TEXT,
+            role TEXT DEFAULT 'all',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        # SETTINGS
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+
+        # MENU BUTTONS
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS menu_buttons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            section TEXT NOT NULL,
+            text TEXT NOT NULL,
+            type TEXT NOT NULL,
+            target TEXT,
+            content_id INTEGER,
+            visible_for TEXT DEFAULT 'all',
+            position INTEGER DEFAULT 0
+        )
+        """)
+
+        # DEFAULT SETTINGS
+        await db.execute("""
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('greeting', 'Привет! Добро пожаловать в бота!')
+        """)
+
+        
+        # Флаг автоматического подтверждения новых пользователей
+        await db.execute("""
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('auto_approve_enabled', 'false')
+        """)
+
+        await db.commit()
+        
+
+# ---------------- ПОЛЬЗОВАТЕЛИ ----------------
+async def add_user(user_id, username=None, first_name=None, last_name=None, role="seller"):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, role)
+        VALUES (?, ?, ?, ?, ?)
+        """, (user_id, username, first_name, last_name, role))
+        await db.commit()
+
+async def get_user_role(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT role FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+async def set_user_role(user_id, role):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+        await db.commit()
+
+async def ban_user(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+async def unban_user(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+async def get_users_by_role(role, only_approved=False):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if only_approved:
+            query = "SELECT user_id FROM users WHERE role = ? AND approved = 1 AND is_banned = 0"
+        else:
+            query = "SELECT user_id FROM users WHERE role = ?"
+        async with db.execute(query, (role,)) as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+async def get_all_users(only_approved=False):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if only_approved:
+            query = "SELECT user_id FROM users WHERE approved = 1 AND is_banned = 0"
+        else:
+            query = "SELECT user_id FROM users"
+        async with db.execute(query) as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+# ---------------- МЕНЮ ----------------
+async def add_menu_button(section, text, btn_type, target=None, content_id=None, visible_for="all", position=0):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO menu_buttons (section, text, type, target, content_id, visible_for, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (section, text, btn_type, target, content_id, visible_for, position))
+        await db.commit()
+
+async def get_menu_buttons_for_role(section, role):
+    async with aiosqlite.connect(DB_PATH) as db:
+        roles_to_see = ROLE_ACCESS.get(role, [role])
+        if 'all' not in roles_to_see:
+            roles_to_see.append('all')
+
+        placeholders = " OR ".join(["visible_for LIKE ?"] * len(roles_to_see))
+        params = [f"%{r}%" for r in roles_to_see]
+
+        query = f"""
+        SELECT id, text, type, target, content_id
+        FROM menu_buttons
+        WHERE section = ?
+        AND ({placeholders})
+        ORDER BY position
+        """
+        async with db.execute(query, (section, *params)) as cursor:
+            return await cursor.fetchall()
+
+async def update_menu_button_visibility(button_id, visible_for):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE menu_buttons SET visible_for = ? WHERE id = ?", (visible_for, button_id))
+        await db.commit()
+
+# ---------------- КОНТЕНТ ----------------
+async def add_content(content_type, data, caption=None, description=None, role="all"):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO content (type, data, caption, description, role)
+        VALUES (?, ?, ?, ?, ?)
+        """, (content_type, data, caption, description, role))
+        await db.commit()
+
+async def get_content_for_role(content_id, role):
+    async with aiosqlite.connect(DB_PATH) as db:
+        query = """
+        SELECT id, type, data, caption, description
+        FROM content
+        WHERE id = ?
+        AND (role = 'all' OR role = ?)
+        """
+        async with db.execute(query, (content_id, role)) as cursor:
+            return await cursor.fetchone()
+
+# ---------------- НАСТРОЙКИ ----------------
+async def get_setting(key):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+async def set_setting(key, value):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (key, value))
+        await db.commit()
+
+async def is_auto_approve_enabled():
+    """Проверяет, включено ли автоматическое подтверждение новых пользователей."""
+    return (await get_setting("auto_approve_enabled")) == "true"
+
+async def toggle_auto_approve():
+    """Переключает состояние авто-подтверждения и возвращает новое значение (True/False)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key='auto_approve_enabled'") as cur:
+            row = await cur.fetchone()
+            current = row[0] if row else "false"
+        new_value = "false" if current == "true" else "true"
+        await db.execute("""
+            INSERT INTO settings (key, value)
+            VALUES ('auto_approve_enabled', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (new_value,))
+        await db.commit()
+    return new_value == "true"
