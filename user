@@ -1,0 +1,319 @@
+import os
+import aiosqlite
+from dotenv import load_dotenv
+from aiogram import Router, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from menu_cache import get_section, load_menu
+from .content_sender import send_content_by_id
+from db import is_auto_approve_enabled
+
+load_dotenv()
+
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+admin_ids_str = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
+
+router = Router()
+
+# ====== Карта наследования ролей ======
+ROLE_ACCESS = {
+    "seller": ["seller"],
+    "admin": ["seller", "admin"],
+    "nsy": ["seller", "admin", "nsy"],
+    "im": ["im"],
+    "office": ["seller", "admin", "nsy", "im", "office"],
+}
+
+# ====== Уведомления ======
+async def notify_admins_new_user(bot, user_id: int, username: str | None):
+    role_buttons = [
+        [
+            InlineKeyboardButton(text="👤 Продавец", callback_data=f"approve_role:{user_id}:seller"),
+            InlineKeyboardButton(text="🛠 Админ",    callback_data=f"approve_role:{user_id}:admin"),
+        ],
+        [
+            InlineKeyboardButton(text="📊 НС",       callback_data=f"approve_role:{user_id}:nsy"),
+            InlineKeyboardButton(text="🏢 Офис",     callback_data=f"approve_role:{user_id}:office"),
+        ],
+        [
+            InlineKeyboardButton(text="📦 IM",       callback_data=f"approve_role:{user_id}:im"),
+        ],
+        [
+            InlineKeyboardButton(text="🚫 Отклонить", callback_data=f"reject:{user_id}")
+        ],
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=role_buttons)
+    uname_str = f"@{username}" if username else "(без username)"
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                aid,
+                f"🆕 Новый пользователь: {user_id} {uname_str}\nВыберите роль для одобрения:",
+                reply_markup=kb
+            )
+        except:
+            pass
+
+async def notify_admins_auto_join(bot, user_id: int, username: str | None):
+    uname_str = f"@{username}" if username else "(без username)"
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                aid,
+                f"🆕 Новый пользователь (авто‑доступ): {uname_str} ({user_id})"
+            )
+        except:
+            pass
+
+# ====== Построение меню ======
+async def build_menu(section: str, role: str):
+    buttons = get_section(section)
+    if not buttons:
+        return None
+
+    kb = []
+    row = []
+    roles_allowed = ROLE_ACCESS.get(role, ["seller"])
+
+    for text, kind, target, content_id, visible_for in buttons:
+        if role != "office" and visible_for and visible_for != "all":
+            allowed_roles = [r.strip() for r in visible_for.split(",") if r.strip()]
+            if not any(r in roles_allowed for r in allowed_roles):
+                continue
+
+        if kind == "open":
+            row.append(InlineKeyboardButton(text=text, callback_data=f"open:{target}"))
+        elif kind == "content":
+            row.append(InlineKeyboardButton(text=text, callback_data=f"content:{section}:{content_id}"))
+        elif kind == "url":
+            row.append(InlineKeyboardButton(text=text, url=target))
+
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+
+    if row:
+        kb.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+# ====== /start ======
+@router.message(Command("start"))
+async def cmd_start(message: types.Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT is_banned, approved, COALESCE(role,'') FROM users WHERE user_id=?",
+            (message.from_user.id,)
+        ) as cur:
+            row = await cur.fetchone()
+
+        if row is None:
+            if await is_auto_approve_enabled():
+                await db.execute(
+                    "INSERT INTO users (user_id, username, is_banned, approved, role) VALUES (?, ?, 0, 1, ?)",
+                    (message.from_user.id, message.from_user.username, "seller")
+                )
+                await db.commit()
+                await notify_admins_auto_join(message.bot, message.from_user.id, message.from_user.username)
+                await load_menu()
+                kb = await build_menu("root", "seller")
+                return await message.answer("✅ Доступ открыт. Добро пожаловать!", reply_markup=kb)
+            else:
+                await db.execute(
+                    "INSERT INTO users (user_id, username, is_banned, approved, role) VALUES (?, ?, 0, 0, ?)",
+                    (message.from_user.id, message.from_user.username, "seller")
+                )
+                await db.commit()
+                await notify_admins_new_user(message.bot, message.from_user.id, message.from_user.username)
+                return await message.answer("⏳ Ваш аккаунт отправлен на одобрение. Пожалуйста, подождите. Если ваш аккаунт долго не одобряют или забанили напишите @minakou_mikhail или @SNG_NSP")
+
+        is_banned, approved, role = row
+        if not role:
+            role = "seller"
+            await db.execute("UPDATE users SET role=? WHERE user_id=?", (role, message.from_user.id))
+            await db.commit()
+
+        if is_banned:
+            return await message.answer("🚫 Доступ к боту ограничен.")
+        if approved == 0:
+            return await message.answer("⏳ Ваш аккаунт ещё не одобрен. Пожалуйста, подождите. Если ваш аккаунт долго не одобряют или забанили напишите @minakou_mikhail или @SNG_NSP")
+
+    await load_menu()
+    kb = await build_menu("root", role)
+    if kb:
+        await message.answer("Добро пожаловать!", reply_markup=kb)
+    else:
+        await message.answer("Меню пока пусто.")
+
+# ====== Открытие раздела ======
+@router.callback_query(F.data.startswith("open:"))
+async def open_section(cb: types.CallbackQuery):
+    section = cb.data.split(":", 1)[1]
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COALESCE(role,'seller') FROM users WHERE user_id=?",
+            (cb.from_user.id,)
+        ) as cur:
+            row = await cur.fetchone()
+            role = row[0] if row else "seller"
+
+    kb = await build_menu(section, role)
+    if kb:
+        await cb.message.edit_reply_markup(reply_markup=kb)
+    else:
+        await cb.answer("Раздел пуст или нет доступа.", show_alert=True)
+
+# ====== Показ контента ======
+@router.callback_query(F.data.startswith("content:"))
+async def show_content(cb: types.CallbackQuery):
+    try:
+        _, section, cid_str = cb.data.split(":", 2)
+        content_id = int(cid_str)
+    except ValueError:
+        return await cb.answer("Ошибка данных.", show_alert=True)
+
+    await send_content_by_id(cb.bot, cb.from_user.id, content_id)
+    await cb.answer()
+    await load_menu()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COALESCE(role,'seller') FROM users WHERE user_id=?",
+            (cb.from_user.id,)
+        ) as cur:
+            row = await cur.fetchone()
+    role = row[0] if row else "seller"
+
+    kb = await build_menu(section, role)
+    if kb:
+        await cb.bot.send_message(cb.from_user.id, "🔹 Выберите пункт меню:", reply_markup=kb)
+
+# ====== Одобрение ======
+@router.callback_query(F.data.startswith("approve_role:"))
+async def approve_with_role(cb: types.CallbackQuery):
+    try:
+        _, user_id_str, role = cb.data.split(":")
+        user_id = int(user_id_str)
+    except:
+        return await cb.answer("Ошибка данных.", show_alert=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET approved=1, role=? WHERE user_id=?", (role, user_id))
+        await db.commit()
+
+        # пробуем достать username из базы
+        cursor = await db.execute("SELECT username FROM users WHERE user_id=?", (user_id,))
+        row = await cursor.fetchone()
+        username = row[0] if row and row[0] else None
+
+    # если username не найден в базе, пробуем получить из Telegram
+    if not username:
+        try:
+            chat = await cb.bot.get_chat(user_id)
+            username = chat.username
+        except:
+            username = None
+
+    # формируем текст с ID и username
+    user_display = f"{user_id}" + (f" (@{username})" if username else "")
+
+    await cb.answer(f"✅ Пользователь одобрен с ролью: {role}", show_alert=True)
+    await cb.message.edit_text(f"✅ Пользователь {user_display} одобрен с ролью: {role}")
+
+    await load_menu()
+    kb = await build_menu("root", role)
+    if kb:
+        try:
+            await cb.bot.send_message(user_id, "🎉 Ваш аккаунт одобрен! Вот меню:", reply_markup=kb)
+        except:
+            pass
+
+
+# ====== Отклонение ======
+@router.callback_query(F.data.startswith("reject:"))
+async def reject_user(cb: types.CallbackQuery):
+    try:
+        _, user_id_str = cb.data.split(":")
+        user_id = int(user_id_str)
+    except:
+        return await cb.answer("Ошибка данных.", show_alert=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET approved=0, is_banned=1 WHERE user_id=?",
+            (user_id,)
+        )
+        await db.commit()
+
+        # пробуем достать username из базы
+        cursor = await db.execute("SELECT username FROM users WHERE user_id=?", (user_id,))
+        row = await cursor.fetchone()
+        username = row[0] if row and row[0] else None
+
+    # если username не найден в базе, пробуем получить из Telegram
+    if not username:
+        try:
+            chat = await cb.bot.get_chat(user_id)
+            username = chat.username
+        except:
+            username = None
+
+    # формируем текст с ID и username
+    user_display = f"{user_id}" + (f" (@{username})" if username else "")
+
+    await cb.answer("🚫 Пользователь отклонён", show_alert=True)
+    await cb.message.edit_text(f"🚫 Пользователь {user_display} отклонён")
+
+    try:
+        await cb.bot.send_message(user_id, "🚫 Ваш доступ к боту отклонён.")
+    except:
+        pass
+
+
+# универсальные хендлеры для ошибок и fallback
+async def _send_unrecognized_with_menu(message: types.Message):
+    role = "seller"
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT COALESCE(role,'seller'), is_banned, approved FROM users WHERE user_id=?",
+                (message.from_user.id,)
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    role, is_banned, approved = row
+                    if is_banned:
+                        return await message.answer("🚫 Доступ к боту ограничен.")
+                    if approved == 0:
+                        return await message.answer("⏳ Ваш аккаунт ещё не одобрен. Пожалуйста, подождите. Если ваш аккаунт долго не одобряют или забанили напишите @minakou_mikhail или @SNG_NSP")
+    except Exception as e:
+        print("Ошибка при проверке доступа:", e)
+
+    kb = None
+    try:
+        await load_menu()
+        kb = await build_menu("root", role)
+    except:
+        kb = None
+
+    text = (
+        "❌ Ошибка: текст не распознан.\n"
+        "Воспользуйтесь меню.\n"
+        "Если меню нет — нажмите /start."
+    )
+    if kb:
+        await message.answer(text, reply_markup=kb)
+    else:
+        await message.answer(text)
+
+@router.message(F.text.startswith("/"))
+async def unknown_command_handler(message: types.Message):
+    await _send_unrecognized_with_menu(message)
+
+@router.message()
+async def fallback_handler(message: types.Message):
+    if message.text and message.text.startswith("/"):
+        return
+    await _send_unrecognized_with_menu(message)
